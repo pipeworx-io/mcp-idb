@@ -1,0 +1,1419 @@
+interface McpToolDefinition {
+  name: string;
+  description: string;
+  /** Human-facing one-liner (fleet #1967). Optional; consumers fall back to
+   *  description. Kept in step with shared/src/types.ts — scripts/lib/
+   *  check-inlined-types.mjs reports drift at publish time. */
+  summary?: string;
+  inputSchema: {
+    type: 'object';
+    properties: Record<string, unknown>;
+    required?: string[];
+    anyOf?: Array<{ required: string[] }>;
+    oneOf?: Array<{ required: string[] }>;
+    allOf?: Array<{ required: string[] }>;
+  };
+  outputSchema?: Record<string, unknown>;
+}
+
+interface McpToolExport {
+  tools: McpToolDefinition[];
+  callTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
+  meter?: { credits: number };
+  cost?: Record<string, unknown>;
+  provider?: string;
+}
+
+/**
+ * Runtime helpers for packs that wrap government open-data platforms.
+ *
+ * Socrata (SODA), CKAN, and ArcGIS FeatureServer/MapServer between them back a large share
+ * of US state and municipal data, and every pack over them re-implements the same fetch,
+ * timeout, retry, and shaping code. These helpers are deliberately small and dependency-free
+ * so `scripts/publish-pack.sh` can inline them into a standalone published pack.
+ *
+ * State agency servers are slow and occasionally hostile: expect stalls, WAF interstitials
+ * served with a 200 or 403, and columns whose names disagree between two datasets on the same
+ * portal. `govFetchJson` therefore retries once by default and raises a message the caller can
+ * turn into a `{ found: false, reason, hint }` rather than a bare throw.
+ */
+
+const DEFAULT_UA = 'pipeworx-mcp/1.0 (+https://pipeworx.io)';
+const DEFAULT_TIMEOUT_MS = 15_000;
+
+interface GovFetchOpts {
+  /** Sent as Accept; defaults to application/json. */
+  accept?: string;
+  /** Socrata app token, sent as X-App-Token. Public endpoints work without one. */
+  appToken?: string;
+  /** Per-attempt budget. State ArcGIS servers routinely need >12s under load. */
+  timeoutMs?: number;
+  /** Extra attempts after the first. Defaults to 1. */
+  retries?: number;
+  userAgent?: string;
+}
+
+async function govFetchText(url: string, opts: GovFetchOpts = {}): Promise<string> {
+  const retries = opts.retries ?? 1;
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const headers: Record<string, string> = {
+        'User-Agent': opts.userAgent ?? DEFAULT_UA,
+        Accept: opts.accept ?? 'application/json',
+      };
+      if (opts.appToken) headers['X-App-Token'] = opts.appToken;
+      const res = await fetch(url, {
+        headers,
+        signal: AbortSignal.timeout(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`upstream ${res.status}${body ? `: ${body.slice(0, 180)}` : ''}`);
+      }
+      return await res.text();
+    } catch (err) {
+      lastErr = err;
+      if (attempt === retries) break;
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+async function govFetchJson<T = unknown>(url: string, opts: GovFetchOpts = {}): Promise<T> {
+  const text = await govFetchText(url, opts);
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    // A WAF interstitial arrives as HTML on the JSON path; say so plainly, because the
+    // alternative reads to a caller as our own parsing bug.
+    const looksLikeChallenge = /<html|just a moment|captcha/i.test(text.slice(0, 400));
+    throw new Error(
+      looksLikeChallenge
+        ? `upstream returned an HTML challenge page instead of JSON (${text.slice(0, 90).replace(/\s+/g, ' ')})`
+        : `upstream returned non-JSON (${text.slice(0, 120)})`,
+    );
+  }
+}
+
+// ── Socrata (SODA 2.x) ──────────────────────────────────────────────
+
+interface SoqlQuery {
+  select?: string;
+  where?: string;
+  group?: string;
+  order?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/** Escape a value for interpolation into a SoQL string literal. */
+function soqlEscape(v: string): string {
+  return v.replace(/'/g, "''");
+}
+
+function soqlUrl(domain: string, resource: string, q: SoqlQuery): string {
+  const p = new URLSearchParams();
+  if (q.select) p.set('$select', q.select);
+  if (q.where) p.set('$where', q.where);
+  if (q.group) p.set('$group', q.group);
+  if (q.order) p.set('$order', q.order);
+  p.set('$limit', String(q.limit ?? 1000));
+  if (q.offset) p.set('$offset', String(q.offset));
+  return `https://${domain}/resource/${resource}.json?${p.toString()}`;
+}
+
+async function soqlRows<T = Record<string, string>>(
+  domain: string,
+  resource: string,
+  q: SoqlQuery,
+  opts: GovFetchOpts = {},
+): Promise<T[]> {
+  return govFetchJson<T[]>(soqlUrl(domain, resource, q), opts);
+}
+
+/**
+ * A Socrata dataset's last row update, as YYYY-MM-DD, for an `as_of` field. Best-effort:
+ * resolves to null rather than failing a call that otherwise has data.
+ */
+async function soqlUpdatedAt(
+  domain: string,
+  resource: string,
+  opts: GovFetchOpts = {},
+): Promise<string | null> {
+  try {
+    const meta = await govFetchJson<{ rowsUpdatedAt?: number }>(
+      `https://${domain}/api/views/${resource}.json`,
+      { ...opts, retries: 0 },
+    );
+    return meta.rowsUpdatedAt ? new Date(meta.rowsUpdatedAt * 1000).toISOString().slice(0, 10) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Largest value of a column, e.g. the latest `year_month` a dataset carries. */
+async function soqlMax(
+  domain: string,
+  resource: string,
+  column: string,
+  opts: GovFetchOpts = {},
+): Promise<string | null> {
+  try {
+    const rows = await soqlRows<Record<string, string>>(
+      domain,
+      resource,
+      { select: `max(${column}) as mx` },
+      opts,
+    );
+    return rows[0]?.mx ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ── CKAN ────────────────────────────────────────────────────────────
+
+/** CKAN's read-only SQL endpoint (datastore_search_sql). */
+async function ckanSql$shared<T = Record<string, string>>(
+  domain: string,
+  sql: string,
+  opts: GovFetchOpts = {},
+): Promise<T[]> {
+  const body = await govFetchJson<{
+    success?: boolean;
+    result?: { records?: T[] };
+    error?: unknown;
+  }>(`https://${domain}/api/3/action/datastore_search_sql?sql=${encodeURIComponent(sql)}`, opts);
+  if (!body.success || !body.result?.records) {
+    throw new Error(`CKAN rejected the query: ${JSON.stringify(body.error ?? {}).slice(0, 200)}`);
+  }
+  return body.result.records;
+}
+
+async function ckanRows<T = Record<string, unknown>>(
+  domain: string,
+  resourceId: string,
+  limit: number,
+  opts: GovFetchOpts = {},
+): Promise<T[]> {
+  const body = await govFetchJson<{ result?: { records?: T[] } }>(
+    `https://${domain}/api/3/action/datastore_search?resource_id=${resourceId}&limit=${limit}`,
+    opts,
+  );
+  return body.result?.records ?? [];
+}
+
+// ── ArcGIS (FeatureServer / MapServer) ──────────────────────────────
+
+interface ArcgisFeature {
+  attributes: Record<string, unknown>;
+  geometry?: { x?: number; y?: number };
+}
+
+interface ArcgisQueryOpts extends GovFetchOpts {
+  where?: string;
+  outFields?: string;
+  orderBy?: string;
+  limit?: number;
+  /** Request geometry in WGS84. Many layers store State Plane, so read lat/lng from here
+   *  rather than from XCOORD/YCOORD attribute columns. */
+  geometry?: boolean;
+  distinct?: boolean;
+}
+
+async function arcgisQuery(layerUrl: string, o: ArcgisQueryOpts = {}): Promise<ArcgisFeature[]> {
+  const p = new URLSearchParams({
+    where: o.where ?? '1=1',
+    outFields: o.outFields ?? '*',
+    returnGeometry: o.geometry ? 'true' : 'false',
+    f: 'json',
+  });
+  if (o.geometry) p.set('outSR', '4326');
+  if (o.orderBy) p.set('orderByFields', o.orderBy);
+  if (o.limit) p.set('resultRecordCount', String(o.limit));
+  if (o.distinct) p.set('returnDistinctValues', 'true');
+  const body = await govFetchJson<{ features?: ArcgisFeature[]; error?: { message?: string } }>(
+    `${layerUrl}/query?${p.toString()}`,
+    o,
+  );
+  if (body.error) throw new Error(`ArcGIS: ${body.error.message ?? 'query rejected'}`);
+  return body.features ?? [];
+}
+
+/** Turn "Y"/"Yes"/"true" flag columns into a list of human-readable service labels. */
+function arcgisFlagLabels(
+  attrs: Record<string, unknown>,
+  labelByField: Record<string, string>,
+): string[] {
+  return Object.entries(labelByField)
+    .filter(([field]) => /^(y|yes|true)$/i.test(String(attrs[field] ?? '')))
+    .map(([, label]) => label);
+}
+
+// ── Small shaping utilities ─────────────────────────────────────────
+
+/** A recoverable "no answer" result. The hint should name something that does work. */
+function govNotFound(
+  reason: string,
+  hint: string,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return { found: false, reason, hint, ...extra };
+}
+
+function govNumber(v: unknown): number | null {
+  if (v === null || v === undefined || v === '') return null;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  const s = String(v).trim();
+  if (s === '') return null;
+  // Parse as-is first. Socrata returns an all-zero aggregate as "0E-24", and stripping
+  // non-numeric characters turns that into "0-24" → NaN, i.e. a real zero reported as
+  // unknown. Number() understands scientific notation, so only fall back to stripping
+  // for values carrying formatting (currency symbols, thousands separators).
+  const direct = Number(s);
+  if (Number.isFinite(direct)) return direct;
+  // Require a digit before stripping: otherwise "abc" reduces to "" and Number("") is 0,
+  // reporting a parse failure as a real zero.
+  if (!/\d/.test(s)) return null;
+  const stripped = Number(s.replace(/[^0-9.\-]/g, ''));
+  return Number.isFinite(stripped) ? stripped : null;
+}
+
+/** Trimmed string argument, or undefined when absent or blank. */
+function govString(args: Record<string, unknown>, key: string): string | undefined {
+  const v = args[key];
+  if (v === undefined || v === null) return undefined;
+  const s = String(v).trim();
+  return s === '' ? undefined : s;
+}
+
+function govLimit(raw: unknown, def: number, max: number): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return def;
+  return Math.min(Math.floor(n), max);
+}
+
+/** Case-insensitive substring test that tolerates a missing haystack. */
+function govContains(hay: unknown, needle: string): boolean {
+  return typeof hay === 'string' && hay.toLowerCase().includes(needle.toLowerCase());
+}
+
+/** Join day/hours pairs into one line, dropping closed and empty days. */
+function govJoinHours(parts: Array<[string, unknown]>): string | null {
+  const out = parts
+    .filter(([, v]) => v && String(v).trim() && !/^closed$/i.test(String(v).trim()))
+    .map(([day, v]) => `${day} ${String(v).trim()}`);
+  return out.length ? out.join('; ') : null;
+}
+
+/**
+ * One place to turn a failed `fetch` into an error a caller can act on.
+ *
+ * Nearly every pack was written the same way:
+ *
+ *     if (!res.ok) throw new Error(`Unsplash: ${res.status}`);
+ *
+ * which discards the response body — and the body is usually where the upstream
+ * says what was actually wrong ("**symbol** not found: GBP", "parameter `year`
+ * out of range", "unknown taxonomy id"). The caller gets a number, cannot
+ * self-correct, and retries the same broken call. A 2026-07-31 sweep found this
+ * shape in 481 of 1,400 packs, 47 of them PLATFORM-keyed.
+ *
+ * It also hides bugs one level down. Two of the first three packs audited had a
+ * second defect that only existed because of this line: unsplash's rate-limit
+ * branch sat BELOW a catch-all and was unreachable, and bea-gov parsed
+ * `BEAAPI.Error.APIErrorDescription` below a `!res.ok` throw that made the
+ * parsing dead code for every non-200.
+ *
+ * DELIBERATELY NOT A CLASSIFIER. It does not add `user_error:` /
+ * `upstream_down:` prefixes. Those decide which tier a failure lands in, and the
+ * `error` tier is what the daily problem-tools list is built from — it means
+ * "Pipeworx has a defect". A 400 is genuinely ambiguous: often a caller's bad
+ * argument, but sometimes a query WE built wrong (ted-eu comma-joined its CPV
+ * values into something TED rejected, and that bug was found only because it sat
+ * in `error`). Blanket-classifying 400s as caller mistakes would have hidden it.
+ * A pack that KNOWS which it is should keep saying so explicitly; this helper is
+ * for the 481 that say nothing at all.
+ */
+
+/** Longest upstream explanation we'll pass through. Enough for a real message,
+ *  short enough that an HTML page or a stack trace can't swamp the error. */
+
+const MAX_DETAIL = 300;
+
+/**
+ * Default bound for `fetchWithTimeout` when a pack doesn't state its own.
+ *
+ * 25s mirrors the number `epo-ops` landed on after measuring the real failure:
+ * a degraded upstream that doesn't error, it just never answers, and a Worker
+ * sits in `await fetch()` until ITS OWN execution budget kills the request —
+ * which can take minutes, not seconds (epo_ops_search_patents measured 4-8
+ * MINUTE hangs before this existed). 25s is short enough that a caller gets a
+ * fast, actionable error instead of holding the connection, and long enough
+ * that it doesn't false-trip on a merely-slow-but-alive upstream.
+ */
+const DEFAULT_FETCH_TIMEOUT_MS = 25_000;
+
+/**
+ * Read the body of a failed response and fold it into a throwable Error.
+ *
+ * Usage — note the `await`, which is the one thing that makes this a mechanical
+ * change rather than a drop-in:
+ *
+ *     if (!res.ok) throw await httpError(res, 'Unsplash');
+ *
+ * Safe to call on any non-ok response: a body that is missing, empty, unreadable
+ * or HTML degrades to exactly the old `Name: 404` string rather than throwing
+ * something new from inside the error path.
+ */
+async function httpError(res: Response, name: string): Promise<Error> {
+  return new Error(await httpErrorMessage(res, name));
+}
+
+/** The message text without constructing an Error — for packs that need to wrap
+ *  it in their own envelope or add an explicit classification prefix. */
+async function httpErrorMessage(res: Response, name: string): Promise<string> {
+  // The one place a 5xx from a host WE run gets stamped as ours. `res.url` is
+  // the URL the fetch actually resolved to (after redirects), so this is a fact
+  // about the call rather than a guess from the `name` the pack passed in —
+  // reword that label freely, the class does not move. See
+  // internal-host-class.ts; no-op for every third-party upstream, which is why
+  // this touches 481 packs' error text and changes none of it.
+  return markInternalOrigin(
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    res.url,
+    res.status,
+  );
+}
+
+/**
+ * Just the upstream's own explanation — no name, no status.
+ *
+ * For a pack that has already said both in its own sentence. epo-ops reads
+ * `EPO rejected this search as too large (HTTP 413) — ${httpErrorMessage(…)}`,
+ * which rendered as `… (HTTP 413) — EPO: 413.` once the XML detail was being
+ * dropped: the upstream named twice, the status twice, and the one thing EPO
+ * actually said ("Not enough characters before truncation character") nowhere
+ * (fleet #712). Returns '' when the body carries nothing readable, so a caller
+ * can fall back to its own wording.
+ */
+async function upstreamDetail(res: Response): Promise<string> {
+  return readDetail(res);
+}
+
+/**
+ * Read a SUCCESSFUL response as JSON, failing loudly when it isn't JSON.
+ *
+ * `httpError` above only ever runs on `!res.ok`, which leaves the nastier half
+ * of the problem unhandled: an upstream that answers **HTTP 200 with an HTML
+ * page**. A bot wall, a login redirect, a maintenance interstitial and a CDN
+ * error page are all 200s, so `res.ok` is true, and `res.json()` then throws
+ * `Unexpected token '<', "<!DOCTYPE "... is not valid JSON`.
+ *
+ * That string is the problem. It names no upstream, carries no status, and
+ * reads like a parser bug in Pipeworx — so it lands in the `error` tier, which
+ * means "we have a defect", and the caller is told nothing they can act on.
+ * data.govt.nz sat dead behind an Imperva challenge this way and every
+ * status-code health check we own reported it green (7889a845). A zero-length
+ * body has the same shape: `Unexpected end of JSON input`, seen this week on
+ * uk-gazette (83% of external calls) and census.
+ *
+ * UNLIKE `httpError`, this one DOES classify, and the asymmetry is deliberate.
+ * A 400 is genuinely ambiguous — often the caller's bad argument, sometimes a
+ * query we built wrong — so blanket-classifying it would hide our own bugs.
+ * There is no such ambiguity here: **no argument a caller can pass makes a JSON
+ * API return an HTML page.** It is always the upstream, so `upstream_down:` is
+ * a statement of fact rather than a guess, and it keeps these out of the
+ * problem-tools list where they crowd out real defects.
+ *
+ *     const data = await parseJson<Feed>(res, 'UK Gazette');
+ *
+ * Call it only after the `!res.ok` check — on a failed response you want
+ * `httpError`, which mines the body for the upstream's own explanation.
+ */
+async function parseJson<T>(res: Response, name: string): Promise<T> {
+  let raw: string;
+  try {
+    raw = await res.text();
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} returned a body that could not be read (HTTP ${res.status}). ` +
+        'The connection most likely dropped mid-response; retrying is reasonable.',
+    );
+  }
+
+  const type = res.headers.get('content-type') ?? 'no content-type';
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected (${type}). ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+
+  // Checked before parsing rather than in the catch, because knowing it is
+  // markup is what turns "we failed to parse something" into "they served a
+  // web page" — the second is diagnosable, the first is not.
+  const head = raw.slice(0, 200).trimStart().toLowerCase();
+  if (head.startsWith('<!doctype') || head.startsWith('<html') || head.startsWith('<?xml')) {
+    const kind = head.startsWith('<?xml') ? 'an XML document' : 'an HTML page';
+    // The summary, not the source. Pasting the first 120 characters of a web
+    // page handed the agent `<!DOCTYPE html><html lang="en"…` — the same leak
+    // this branch exists to describe (fleet #712).
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with ${kind} instead of JSON (${type}). ` +
+        'That is typically a bot wall, a login redirect or a maintenance page — it is returned as a SUCCESS, ' +
+        `so status-code health checks read it as fine. No argument change will get past it. ` +
+        `The page says: ${summarizeErrorBody(raw) || 'nothing readable'}`,
+    );
+  }
+
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON (${type}). ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
+
+/**
+ * `fetch`, but bounded — the fix for a systemic gap found 2026-08-30: a grep
+ * audit of every pack's `mcps/*\/src/index.ts` found 1,339 of ~1,500 call
+ * `fetch()` with NO timeout guard anywhere in the file. Two of those
+ * (epo-ops, statcan) were confirmed live-hanging for 4-8 minutes before this
+ * existed — every unguarded call carries the same risk, just unconfirmed.
+ *
+ * Mirrors the `epoFetch` wrapper `mcps/epo-ops/src/index.ts` shipped first:
+ * bound the request with `AbortSignal.timeout`, and on a timeout/abort throw
+ * an `upstream_down:` error that names the upstream and the bound rather than
+ * letting the raw `TimeoutError`/`AbortError` (which names neither) propagate.
+ * `upstream_down:` is deliberate, same reasoning as `parseJson` above — no
+ * argument a caller passes can make an upstream hang, so it is always the
+ * upstream's fault, and marking it that way keeps a slow API off the
+ * problem-tools list where it would crowd out our own defects.
+ *
+ * Usage — a mechanical swap for a bare `fetch(url, init)`:
+ *
+ *     const res = await fetchWithTimeout(url, init, 'Some API');
+ *
+ * Pass `timeoutMs` as a fourth argument to override the default for a pack
+ * with a known-slower upstream; the label should be the same short name you'd
+ * pass to `httpError`/`httpErrorMessage` for that call.
+ */
+async function fetchWithTimeout(
+  url: string | URL,
+  init: RequestInit = {},
+  name: string,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+): Promise<Response> {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (err) {
+    if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      // States the OBSERVATION (no response in N seconds), not a diagnosis.
+      // "appears to be degraded" is an inference about the vendor that we have
+      // not checked, and it is wrong in a way that misdirects whoever reads it:
+      // a timeout from a Worker can equally mean OUR egress is blocked.
+      //
+      // Measured today (2026-09-01, fleet #1047): every call to
+      // mainnet.base.org failed from the x402 facilitator while the identical
+      // request from a laptop returned 200. Base was entirely healthy; the
+      // public RPC refuses Cloudflare Worker egress. Had this message fired
+      // there it would have blamed Base by name, and the next person would have
+      // waited for a vendor outage to clear that did not exist.
+      // A timeout has no status to test — there is no response at all — so
+      // `markInternalOrigin` is called without one: an origin we run that never
+      // answered is an availability failure by definition. This is the half of
+      // fleet #1096 with neither a SQLSTATE nor a status code to key on.
+      throw new Error(
+        markInternalOrigin(
+          `upstream_down: ${name} did not respond within ${timeoutMs / 1000}s. ` +
+            `That can be ${name} being slow or down, or this environment being unable to reach it ` +
+            `(some hosts refuse datacenter/Worker egress) — retry shortly, and check reachability ` +
+            `from elsewhere before concluding ${name} is down.`,
+          url,
+        ),
+      );
+    }
+    throw err;
+  }
+}
+
+function detailSuffix(detail: string): string {
+  return detail ? ` — ${detail}` : '';
+}
+
+async function readDetail(res: Response): Promise<string> {
+  let raw: string;
+  try {
+    raw = await res.text();
+  } catch {
+    // Body already consumed, or the connection died mid-read. The status alone
+    // is still worth throwing — never let the error path throw its own error.
+    return '';
+  }
+  return summarizeErrorBody(raw);
+}
+
+/**
+ * Turn ANY error body — JSON, HTML, XML or plain text — into one short phrase
+ * that never contains markup.
+ *
+ * This used to just drop an HTML or XML body on the floor, on the reasoning
+ * that markup crowds out the status. That was half right. Dropping it loses the
+ * one sentence a caller could have acted on: an `Access Denied` title, an SDMX
+ * `<message:Error>` text, an OPS fault string. A 2026-08-30 support sweep
+ * measured 13 of 291 caller-facing error rows carrying a raw page or document
+ * verbatim, across 11 packs, and in every one of them the useful content —
+ * "Access Denied", "Invalid country code", "SCRAPE_TIMEOUT" — was in there,
+ * buried in markup the agent had to parse out of a string (fleet #712).
+ *
+ * So: extract the meaning, discard the markup. The output is passed through
+ * `stripMarkup` unconditionally, which is what lets `check:error-body-leak`
+ * assert mechanically that no caller-facing message can contain `<?xml`,
+ * `<!DOCTYPE` or `<html`.
+ */
+function summarizeErrorBody(raw: string): string {
+  if (!raw || !raw.trim()) return '';
+
+  const head = raw.slice(0, 400).trimStart().toLowerCase();
+
+  // An HTML error page (Cloudflare interstitial, nginx default, a login
+  // redirect) says what it is in its <title>, and almost nowhere else.
+  if (head.startsWith('<!doctype') || head.startsWith('<html')) {
+    const title = htmlTitle(raw);
+    return title
+      ? `${title} (upstream returned an HTML error page, not an API response)`
+      : 'upstream returned an HTML error page, not an API response';
+  }
+
+  // XML fault documents — EPO OPS, SDMX (`<message:Error>`), SOAP faults. The
+  // human sentence sits in a child element whose tag name says what it is.
+  if (head.startsWith('<?xml') || head.startsWith('<')) {
+    const fault = xmlFaultText(raw);
+    return fault
+      ? `${stripMarkup(fault).slice(0, MAX_DETAIL)} (from the upstream's XML error document)`
+      : 'upstream returned an XML error document with no readable message';
+  }
+
+  // Most JSON error bodies bury one human sentence among ids and echoed request
+  // params. Prefer that sentence; fall back to the whole body when the shape is
+  // unfamiliar, since an unfamiliar shape is exactly when we can least afford to
+  // guess wrong and show nothing.
+  const fromJson = messageFromJson(raw);
+  return stripMarkup(fromJson ?? raw).slice(0, MAX_DETAIL);
+}
+
+/** The `<title>` of an HTML error page, or its first `<h1>` — the two places a
+ *  bot wall, a 502 and an "Access Denied" all state what happened. */
+function htmlTitle(raw: string): string | null {
+  const head = raw.slice(0, 4000);
+  for (const re of [/<title[^>]*>([\s\S]*?)<\/title>/i, /<h1[^>]*>([\s\S]*?)<\/h1>/i]) {
+    const m = re.exec(head);
+    const text = m ? stripMarkup(m[1]) : '';
+    if (text) return text.slice(0, 160);
+  }
+  return null;
+}
+
+/** Tag names that carry the explanation in an XML fault document, namespace
+ *  prefix optional (`<message:Error>`, `<com:Text>`, `<faultstring>`). */
+const XML_FAULT_TAG_RE =
+  /<(?:[A-Za-z0-9_.-]+:)?(?:text|message|description|faultstring|reason|detail|title|errormessage|error)\b[^>]*>([^<]{2,400})</i;
+
+function xmlFaultText(raw: string): string | null {
+  const head = raw.slice(0, 8000);
+  const tagged = XML_FAULT_TAG_RE.exec(head);
+  if (tagged && tagged[1].trim()) return tagged[1];
+
+  // Nothing conventionally named — take the longest text node instead. A fault
+  // document with one sentence in an oddly named element is still readable;
+  // returning nothing at all is not.
+  let best = '';
+  for (const m of head.matchAll(/>([^<>]{8,400})</g)) {
+    const text = m[1].trim();
+    if (text.length > best.length) best = text;
+  }
+  return best || null;
+}
+
+/**
+ * Remove every tag and stray angle bracket, then collapse whitespace.
+ *
+ * Applied to everything on the way out, including the JSON and plain-text
+ * paths, because an upstream is free to embed markup in a JSON string field —
+ * and a leak is a leak regardless of which branch produced it.
+ */
+function stripMarkup(s: string): string {
+  return collapse(decodeEntities(s.replace(/<[^>]*>/g, ' ')).replace(/[<>]/g, ' '));
+}
+
+/** The handful of entities that show up in error-page titles. Decoded AFTER
+ *  tags are stripped and BEFORE the angle-bracket sweep, so `&lt;script&gt;`
+ *  in a title cannot decode into markup that survives — EMBL-EBI's ChEMBL 500
+ *  page renders as `500 Internal Server Error &lt; EMBL-EBI` otherwise. */
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&(?:amp|#0*38);/gi, '&')
+    .replace(/&(?:lt|#0*60);/gi, '<')
+    .replace(/&(?:gt|#0*62);/gi, '>')
+    .replace(/&(?:quot|#0*34);/gi, '"')
+    .replace(/&(?:#0*39|apos|#x0*27);/gi, "'")
+    .replace(/&nbsp;/gi, ' ');
+}
+
+/** The conventional "what went wrong" field, under any of the names upstreams
+ *  actually use. Checked in order; first non-empty string wins. */
+const MESSAGE_KEYS = [
+  'message', 'error_message', 'errorMessage', 'detail', 'details',
+  'description', 'error_description', 'reason', 'title', 'fault',
+];
+
+function messageFromJson(raw: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  return pickMessage(parsed, 0);
+}
+
+function pickMessage(node: unknown, depth: number): string | null {
+  // Two levels covers `{error: {message}}` and `{errors: [{detail}]}`, the two
+  // shapes that account for nearly all of them, without walking a large payload.
+  if (depth > 2 || node == null) return null;
+
+  if (typeof node === 'string') return node.trim() || null;
+
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = pickMessage(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  if (typeof node !== 'object') return null;
+  const obj = node as Record<string, unknown>;
+
+  for (const key of MESSAGE_KEYS) {
+    const v = obj[key];
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  // `{error: …}` where error is itself an object or a string — the single most
+  // common wrapper, so it is worth descending into by name rather than scanning
+  // every key and risking picking up an echoed request parameter.
+  for (const key of ['error', 'errors', 'fault', 'Error', 'data']) {
+    if (key in obj) {
+      const found = pickMessage(obj[key], depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+/** Errors are read in a single line of log output; newlines and runs of
+ *  whitespace make a multi-line body unreadable there. */
+function collapse(s: string): string {
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
+ *
+ * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
+ * keying on the SQLSTATE inside PostgREST's four-key error envelope. That
+ * covered the majority and structurally could not cover the rest: the rest
+ * never reach Postgres, so they carry no SQLSTATE. What was left, measured over
+ * the 24h to 2026-09-02T15:00Z (fleet #1096):
+ *
+ *     5  pipeworx-catalog  get_pack_tools     Pipeworx catalog error: 522 — error code: 522
+ *     3  fleet             fleet_list_open …  upstream_down: Fleet task queue did not respond within 25s
+ *
+ * 521/522/523/526 are Cloudflare saying its edge could not reach an ORIGIN, and
+ * in both of those rows the origin is ours — `gateway.pipeworx.io` for the
+ * catalog pack (it self-fetches when the gateway hasn't injected a manifest),
+ * our own Supabase for fleet. There is no third party anywhere in either call.
+ * Same defect as #1089: our own outage filed under `upstream_down`, the one
+ * class that means "the source is unreachable and there is nothing for us to
+ * fix", which is why the problem-tools triage skips it.
+ *
+ * WHY NOT A WORDING RULE. The obvious fix is to match `fleet db error:` and
+ * `Pipeworx catalog error:` in classifyToolError. Each is emitted from exactly
+ * one site today, so it would work today. It would also rot the first time
+ * somebody rewords a label — silently, and in the direction of hiding our own
+ * outage, which is worse than the bug being fixed. Every prose rule in
+ * error-class.ts has needed widening as packs invented new wording (#409/#450/
+ * #584); that history is most of that file's comment budget.
+ *
+ * WHAT THIS KEYS ON INSTEAD: **the host the call actually reached.** A URL's
+ * hostname is a fact about the call, not a guess about its prose. Two
+ * consequences that a pack-level flag could not give us, and the reason the
+ * flag was rejected:
+ *
+ *   - It describes the CALL, not the pack. `govcon-intel` fans out to our own
+ *     Supabase AND to genuine third parties; `court-listener` holds our cache
+ *     in Supabase and fetches courtlistener.com. An `internallyHosted: true` on
+ *     either pack would relabel a real third-party outage as ours — inventing
+ *     work, which is the same class of error in the opposite direction.
+ *   - It covers every future internal pack for free, instead of one declared
+ *     slug at a time.
+ *
+ * WHY IT SURVIVES A REWORD. The marker below is not matched as a literal by two
+ * separate files. `markInternalOrigin()` writes it and `internalHostMetricsClass()`
+ * reads it, both from the single exported `INTERNAL_ORIGIN_MARKER` constant in
+ * this module — so changing the wording changes both sides in the same edit and
+ * cannot desynchronise them. The pack's own label (`fleet db error:`,
+ * `Pipeworx catalog error:`) is not read at all: reword it freely, the class is
+ * unaffected. That is the property `stripClassPrefix` lacked when it drifted
+ * from its own classifier three times and needed a CI gate to hold them
+ * together.
+ *
+ * WHERE THE 5xx TEST LIVES. `markInternalOrigin` is called from the places that
+ * hold the real `Response` — `httpError`/`httpErrorMessage` and the timeout
+ * branch of `fetchWithTimeout` in `shared/src/http.ts` — so "is this an
+ * availability failure" is decided from the actual status code, never re-derived
+ * by scraping a number out of a sentence. A 404 from our own registry for a slug
+ * that does not exist is a caller's bad argument and is deliberately NOT marked.
+ */
+
+/**
+ * OUR OWN web service was unreachable — not an upstream, and never `upstream_down`.
+ *
+ * ONE value, not three, unlike `internal_db_*`. That split existed because a
+ * slow query, an exhausted pool and an unknown SQLSTATE have different owners
+ * and different fixes. Here there is only one story to tell — an origin we run
+ * did not answer the edge — and one owner. A bucket with no distinct owner per
+ * value is decoration; #724 is what happens when a class holds several
+ * situations, and inventing sub-values ahead of a reason to act on them
+ * differently is the same mistake with the sign flipped.
+ *
+ * METRICS ONLY, exactly like PLATFORM_KEY_ERROR_CLASS and the internal_db
+ * values. `classifyToolError` still answers `upstream_down` for the retry and
+ * hint paths, which only care whether retrying or a sibling tool might work —
+ * and it might. Nothing a caller sees or is charged changes here.
+ *
+ * READ SIDE: this value is in BROKEN_TOOL_CLASSES, FAULT_CLASSES and
+ * ALL_ERROR_CLASSES in `workers/registry-api/src/index.ts`. All three, or it
+ * lands on no dashboard — fleet #721 is the warning, where the #719 split
+ * worked on the write side and was invisible for weeks.
+ */
+const INTERNAL_SERVICE_UNREACHABLE_CLASS = 'internal_service_unreachable';
+
+/**
+ * The token that carries "this origin is ours" from the call site to the
+ * classifier.
+ *
+ * Appended to the error message rather than attached to the Error object,
+ * because the object does not survive the trip: 275 packs return `{ error:
+ * string }` instead of throwing, the gateway reads `observedError` as a string,
+ * and the fleet pack rebuilds its error from a captured status + body across a
+ * retry loop. A property on an Error would be dropped by every one of those
+ * paths and the class would work in tests and vanish in production.
+ *
+ * Written as a sentence rather than a sigil because it is going to be read by
+ * whoever gets the error, and "our own service, not a third party" is the
+ * single most useful thing to tell them — fetchWithTimeout's own comment
+ * (fleet #1047) is about exactly this ambiguity, where blaming a healthy vendor
+ * by name sent the next person waiting for an outage that did not exist.
+ */
+const INTERNAL_ORIGIN_MARKER = ' [pipeworx-hosted origin — our own service, not a third party]';
+
+/**
+ * Supabase's data plane for a project is `<ref>.supabase.co`, where the ref is
+ * exactly twenty lowercase letters (ours is `pqauisounztsgdgfkhke`).
+ *
+ * Matching the shape rather than listing the ref keeps this correct when we add
+ * a project — `supabaseEnv` on a pack entry already points some packs at a
+ * second one — while still excluding `status.supabase.co`, which is Supabase's
+ * own status page and emphatically not our database. Verified 2026-09-02 by
+ * `grep -rhoE '[a-z0-9-]+\.supabase\.(co|in)' mcps shared workers scripts`: the
+ * only real project ref anywhere in the tree is ours, the rest are doc
+ * placeholders (`abc`, `xyz`, `example`) which this pattern also excludes. Same
+ * finding internal-db-class.ts relies on for the PostgREST envelope being ours
+ * by construction.
+ */
+const SUPABASE_PROJECT_HOST = /^[a-z]{20}\.supabase\.(co|in)$/;
+
+/**
+ * Is this a host WE run?
+ *
+ * Deliberately NOT including `*.workers.dev`: plenty of third-party APIs are
+ * hosted on workers.dev, so the suffix says where something runs and not who
+ * owns it. Every internal call we actually make goes to a `pipeworx.io`
+ * hostname or to our Supabase project, both of which are ownership facts.
+ *
+ * Returns false on anything unparseable rather than throwing — this runs inside
+ * an error path, and an error path that can itself throw turns a diagnosable
+ * failure into a mystery.
+ */
+function isPipeworxOrigin(url: string | URL | undefined | null): boolean {
+  if (!url) return false;
+  let host: string;
+  try {
+    host = new URL(url instanceof URL ? url.href : url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === 'pipeworx.io' || host.endsWith('.pipeworx.io')) return true;
+  return SUPABASE_PROJECT_HOST.test(host);
+}
+
+/**
+ * Append the marker when this failure was OUR origin failing to answer.
+ *
+ * `status` is the HTTP status when there is one, and omitted for a timeout —
+ * where there is no response at all, and "the origin did not answer" is the
+ * whole observation. Statuses below 500 are left alone: a 404 from our own
+ * registry for a slug that does not exist is the caller's argument, not our
+ * outage, and marking it would put ordinary 404s on the incident dashboard.
+ *
+ * Idempotent, so a message that is wrapped and re-marked on the way up (the
+ * fleet pack's retry loop re-throws through two layers) carries the marker once.
+ */
+function markInternalOrigin(
+  message: string,
+  url: string | URL | undefined | null,
+  status?: number,
+): string {
+  if (status !== undefined && status < 500) return message;
+  if (!isPipeworxOrigin(url)) return message;
+  if (message.includes(INTERNAL_ORIGIN_MARKER)) return message;
+  return message + INTERNAL_ORIGIN_MARKER;
+}
+
+/**
+ * Which blob4 value a failure from our own web services books as, or undefined
+ * if this is not one.
+ *
+ * Ordered AFTER `internalDbMetricsClass` at the call site: a PostgREST envelope
+ * from our own Supabase is a strictly more specific statement about the same
+ * row (which of our services, and why), and the two cannot disagree about
+ * whether the failure is ours.
+ */
+function internalHostMetricsClass(error: string): string | undefined {
+  return error.includes(INTERNAL_ORIGIN_MARKER) ? INTERNAL_SERVICE_UNREACHABLE_CLASS : undefined;
+}
+/**
+ * IDB (Inter-American Development Bank) Procurement MCP.
+ *
+ * Sourced from IDB's public, keyless CKAN open-data portal (data.iadb.org,
+ * api/3/action/*). Three CKAN Datastore-backed resources, queried live via
+ * datastore_search_sql — every query is a live pass-through, nothing is
+ * downloaded or cached on our side:
+ *
+ *   - project-procurement-bidding-notices-and-notification-of-contract-awards
+ *     (~37k rows) — live bidding notices, expressions of interest, and award
+ *     notifications across IDB-financed projects in 26 Latin American and
+ *     Caribbean countries.
+ *   - idb-project-procurement-contract-awards-data (~159k rows, ~70MB as a
+ *     flat CSV) — award-level contract detail (firm, amount, sector, dates).
+ *     The upstream ALSO exposes this via CKAN's Datastore, which is
+ *     server-side filterable/sortable SQL — so the 70MB file itself is never
+ *     fetched; every query here is a live, indexed lookup against the same
+ *     data the file contains.
+ *   - dataset-of-sanctioned-firms-and-individuals (~1,300 rows) — IDB's own
+ *     debarment list PLUS the cross-debarment lists of four other
+ *     multilateral development banks (World Bank Group, Asian Development
+ *     Bank, African Development Bank, EBRD) that IDB republishes under a
+ *     joint cross-debarment agreement. One name search answers "is this
+ *     vendor debarred by any of five MDBs".
+ *
+ * Bilingual/accented-name trap (verified live): the upstream's own full-text
+ * search (`q=` param on datastore_search) is accent-SENSITIVE — `q=Gonzalez`
+ * (unaccented) returns zero rows against a dataset full of "González" with
+ * the accent. `check_mdb_debarment` never uses `q=`; it fetches the whole
+ * (small) debarment table and matches with its own diacritic-folded,
+ * token-substring comparison so "Gonzalez" and "González" hit the same row.
+ *
+ * All three resources are queried with parameterized-by-hand SQL (CKAN's
+ * datastore_search_sql has no bind-param support) — every string argument is
+ * quote-escaped before being interpolated; CKAN's SQL endpoint itself accepts
+ * SELECT-only statements against a read replica.
+ */
+
+
+const UA = 'pipeworx-mcp-idb/1.0 (+https://pipeworx.io)';
+const BASE = 'https://data.iadb.org/api/3/action';
+
+const NOTICES_RESOURCE = '856aabfd-2c6a-48fb-a8b8-19f3ff443618';
+const AWARDS_RESOURCE = 'dd09c605-9cd8-49c5-92dc-191ff6ecdd58';
+const DEBARMENT_RESOURCE = 'cd0bd9ac-18c6-44bc-8592-9be468c2efd9';
+
+async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response> {
+  const headers = { 'User-Agent': UA, Accept: 'application/json', ...(init?.headers ?? {}) };
+  return fetchWithTimeout(url, { ...init, headers }, 'IDB Open Data (data.iadb.org)');
+}
+
+type Raw = Record<string, unknown>;
+
+interface CkanResult {
+  records: Raw[];
+  fields?: { id: string; type: string }[];
+  total?: number;
+}
+
+interface CkanEnvelope {
+  success: boolean;
+  result?: CkanResult;
+  error?: { message?: string; __type?: string };
+}
+
+/** Escape a value for interpolation into a CKAN datastore_search_sql string literal. */
+function esc(v: string): string {
+  return v.replace(/'/g, "''");
+}
+
+async function ckanSql(sql: string): Promise<CkanResult> {
+  const url = new URL(`${BASE}/datastore_search_sql`);
+  url.searchParams.set('sql', sql);
+  const res = await pwFetch(url);
+  const body = (await res.json()) as CkanEnvelope;
+  if (!res.ok || !body.success || !body.result) {
+    throw new Error(`IDB CKAN query failed: ${body.error?.message ?? `HTTP ${res.status}`}`);
+  }
+  return body.result;
+}
+
+async function ckanSearch(resourceId: string, limit: number): Promise<CkanResult> {
+  const url = new URL(`${BASE}/datastore_search`);
+  url.searchParams.set('resource_id', resourceId);
+  url.searchParams.set('limit', String(limit));
+  const res = await pwFetch(url);
+  const body = (await res.json()) as CkanEnvelope;
+  if (!res.ok || !body.success || !body.result) {
+    throw new Error(`IDB CKAN query failed: ${body.error?.message ?? `HTTP ${res.status}`}`);
+  }
+  return body.result;
+}
+
+// --- shared helpers -----------------------------------------------------
+
+function strArg(v: unknown): string | undefined {
+  if (typeof v === 'string') {
+    const t = v.trim();
+    return t ? t : undefined;
+  }
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+  return undefined;
+}
+
+function boolArg(v: unknown, dflt: boolean): boolean {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'string') {
+    const s = v.trim().toLowerCase();
+    if (s === 'true' || s === '1' || s === 'yes') return true;
+    if (s === 'false' || s === '0' || s === 'no') return false;
+  }
+  return dflt;
+}
+
+function clampInt(v: unknown, dflt: number, min: number, max: number): number {
+  let n: number;
+  if (typeof v === 'number' && Number.isFinite(v)) n = Math.trunc(v);
+  else if (typeof v === 'string' && v.trim() && Number.isFinite(Number(v))) n = Math.trunc(Number(v));
+  else return dflt;
+  return Math.min(max, Math.max(min, n));
+}
+
+function str(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  const t = v.trim();
+  return t ? t : null;
+}
+
+function today(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+// --- notice type normalization -------------------------------------------
+
+// Verified live (SELECT DISTINCT "type"): values carry inconsistent trailing
+// whitespace ("AWARD", "AWARD ", "AWARD   " all occur) — always TRIM in SQL
+// and match with a prefix ILIKE, never equality.
+const NOTICE_TYPE_MAP: Record<string, string> = {
+  award: 'AWARD',
+  awards: 'AWARD',
+  general: 'GENERAL',
+  gpn: 'GENERAL',
+  eoi: 'EOI',
+  'expression of interest': 'EOI',
+  specific: 'SPECIFIC',
+  spn: 'SPECIFIC',
+  rfi: 'REQUEST FOR INFORMATION',
+  'request for information': 'REQUEST FOR INFORMATION',
+};
+
+function normalizeNoticeType(v: string): string {
+  const key = v.trim().toLowerCase();
+  return NOTICE_TYPE_MAP[key] ?? v.trim().toUpperCase();
+}
+
+function shapeNotice(r: Raw): Record<string, unknown> {
+  return {
+    notice_id: str(r.noticeid),
+    type: str(r.type),
+    country: str(r.countryname),
+    project_number: str(r.projectnumber),
+    project_name: str(r.projectname),
+    loan_number: str(r.loannumber),
+    title: str(r.noticetitle),
+    sector: str(r.sectorenglnm) ?? str(r.sector),
+    procurement_method: str(r.prcrmnt_mthd_engl_nm),
+    category: str(r.category_nm),
+    publication_date: str(r.publicationdate),
+    deadline: str(r.deadline),
+    project_url: str(r.proyecturl),
+    document_url: str(r.documenturl),
+  };
+}
+
+async function searchNotices(args: Raw): Promise<unknown> {
+  const country = strArg(args.country);
+  const sector = strArg(args.sector);
+  const keyword = strArg(args.keyword);
+  const typeArg = strArg(args.type);
+  const openOnly = boolArg(args.open_only, true);
+  const limit = clampInt(args.limit, 15, 1, 50);
+
+  const where: string[] = [];
+  if (country) where.push(`countryname ILIKE '%${esc(country)}%'`);
+  if (sector) where.push(`sectorenglnm ILIKE '%${esc(sector)}%'`);
+  if (keyword) where.push(`(noticetitle ILIKE '%${esc(keyword)}%' OR projectname ILIKE '%${esc(keyword)}%')`);
+  const normType = typeArg ? normalizeNoticeType(typeArg) : undefined;
+  if (normType) where.push(`TRIM(type) ILIKE '${esc(normType)}%'`);
+  if (openOnly && normType !== 'AWARD') {
+    where.push(`deadline >= '${today()}'`);
+    where.push(`deadline != ''`);
+  }
+
+  const orderBy = openOnly && normType !== 'AWARD' ? 'deadline ASC' : 'publicationdate DESC';
+  const sql =
+    `SELECT noticeid, type, countryname, projectnumber, projectname, loannumber, noticetitle, ` +
+    `sectorenglnm, sector, prcrmnt_mthd_engl_nm, category_nm, publicationdate, deadline, proyecturl, documenturl ` +
+    `FROM "${NOTICES_RESOURCE}" ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ${orderBy} LIMIT ${limit}`;
+
+  const result = await ckanSql(sql);
+  const notices = result.records.map(shapeNotice);
+  return {
+    count: notices.length,
+    filters: {
+      ...(country ? { country } : {}),
+      ...(sector ? { sector } : {}),
+      ...(keyword ? { keyword } : {}),
+      ...(normType ? { type: normType } : {}),
+      open_only: openOnly && normType !== 'AWARD',
+    },
+    notices,
+    ...(notices.length === 0
+      ? {
+          note: 'No matching notices — try a broader country name, drop the sector filter, or set open_only:false to include closed/past notices.',
+        }
+      : {}),
+    source: 'IDB Open Data — Project Procurement Bidding Notices and Notification of Contract Awards (data.iadb.org, keyless CKAN Datastore)',
+  };
+}
+
+async function getNotice(args: Raw): Promise<unknown> {
+  const noticeId = strArg(args.notice_id);
+  if (!noticeId) {
+    return {
+      found: false,
+      reason: 'missing_argument',
+      hint: 'idb_get_notice requires notice_id — find one via idb_search_notices results (field notice_id).',
+    };
+  }
+  const sql =
+    `SELECT noticeid, type, countryname, projectnumber, projectname, loannumber, noticetitle, ` +
+    `sectorenglnm, sector, prcrmnt_mthd_engl_nm, category_nm, publicationdate, deadline, proyecturl, documenturl, ` +
+    `process_id, procurement_id, process_nm, process_desc ` +
+    `FROM "${NOTICES_RESOURCE}" WHERE noticeid = '${esc(noticeId)}' ORDER BY publicationdate DESC LIMIT 10`;
+  const result = await ckanSql(sql);
+  if (result.records.length === 0) {
+    return {
+      found: false,
+      reason: 'not_found',
+      notice_id: noticeId,
+      hint: 'No notice with that id — ids come from idb_search_notices results, not from IDB project numbers.',
+    };
+  }
+  return {
+    found: true,
+    notice_id: noticeId,
+    ...(result.records.length > 1 ? { revision_count: result.records.length } : {}),
+    notice: shapeNotice(result.records[0]),
+    ...(result.records.length > 1
+      ? { all_revisions: result.records.map(shapeNotice), note: 'Multiple entries share this notice id (amendments/re-publications) — newest first.' }
+      : {}),
+    source: 'IDB Open Data — Project Procurement Bidding Notices and Notification of Contract Awards (data.iadb.org, keyless CKAN Datastore)',
+  };
+}
+
+function shapeAward(r: Raw): Record<string, unknown> {
+  return {
+    contract_id: str(r.contract_id),
+    contract_type: str(r.contract_type),
+    status: str(r.status),
+    project_number: str(r.project_number),
+    project_name: str(r.project_name),
+    operation_number: str(r.operation_number),
+    country: str(r.operation_country_name),
+    sector: str(r.economic_sector_name),
+    procurement_type: str(r.procurement_type),
+    idb_amount: str(r.idb_amount),
+    total_amount: str(r.total_amount),
+    borrower: str(r.borrower_name),
+    executing_agency: str(r.executing_agency),
+    awarded_firm: str(r.awarded_firm_name),
+    awarded_firm_country: str(r.awarded_firm_country_name),
+    contract_year: str(r.contract_year),
+    signature_date: str(r.signature_date),
+    start_date: str(r.start_date),
+    stop_date: str(r.stop_date),
+  };
+}
+
+async function searchAwards(args: Raw): Promise<unknown> {
+  const country = strArg(args.country);
+  const firm = strArg(args.firm);
+  const sector = strArg(args.sector);
+  const year = strArg(args.year);
+  const keyword = strArg(args.keyword);
+  const limit = clampInt(args.limit, 15, 1, 50);
+
+  const where: string[] = [];
+  if (country) where.push(`operation_country_name ILIKE '%${esc(country)}%'`);
+  if (firm) where.push(`awarded_firm_name ILIKE '%${esc(firm)}%'`);
+  if (sector) where.push(`economic_sector_name ILIKE '%${esc(sector)}%'`);
+  if (year) where.push(`contract_year = '${esc(year)}'`);
+  if (keyword) where.push(`project_name ILIKE '%${esc(keyword)}%'`);
+
+  const sql =
+    `SELECT contract_id, contract_type, status, project_number, project_name, operation_number, ` +
+    `operation_country_name, economic_sector_name, procurement_type, idb_amount, total_amount, ` +
+    `borrower_name, executing_agency, awarded_firm_name, awarded_firm_country_name, contract_year, ` +
+    `signature_date, start_date, stop_date ` +
+    `FROM "${AWARDS_RESOURCE}" ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY signature_date DESC LIMIT ${limit}`;
+
+  const result = await ckanSql(sql);
+  const awards = result.records.map(shapeAward);
+  return {
+    count: awards.length,
+    filters: {
+      ...(country ? { country } : {}),
+      ...(firm ? { firm } : {}),
+      ...(sector ? { sector } : {}),
+      ...(year ? { year } : {}),
+      ...(keyword ? { keyword } : {}),
+    },
+    awards,
+    ...(awards.length === 0
+      ? { note: 'No matching awards — many contracts (especially individual-consultant selections) record the firm as "Not Available"; try broadening or dropping the firm filter.' }
+      : {}),
+    source: 'IDB Open Data — Project Procurement Contract Awards Data (data.iadb.org, keyless CKAN Datastore; ~159k awards, queried live, not downloaded)',
+  };
+}
+
+// --- debarment (5-bank cross-debarment list) -----------------------------
+
+const DEBARMENT_SOURCES = ['IDB', 'WBG cross debarment', 'ADB cross debarment', 'AfDB cross debarment', 'EBRD cross debarment'];
+
+/** Strip diacritics + casefold, so "González" and "Gonzalez" compare equal.
+ * IDB's own upstream full-text search does NOT do this (verified live:
+ * q=Gonzalez returns 0 rows against a table full of "González") — this is
+ * why check_mdb_debarment never uses q= and instead matches client-side. */
+function fold(s: string): string {
+  return s
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+let debarmentCache: { rows: Raw[]; fetchedAt: number } | null = null;
+const DEBARMENT_TTL_MS = 5 * 60 * 1000;
+
+async function loadDebarment(): Promise<Raw[]> {
+  if (debarmentCache && Date.now() - debarmentCache.fetchedAt < DEBARMENT_TTL_MS) {
+    return debarmentCache.rows;
+  }
+  // Whole table is ~1.3k rows / ~150KB — one call, no pagination needed
+  // (verified live: a single limit=2000 request returns every row).
+  const result = await ckanSearch(DEBARMENT_RESOURCE, 2000);
+  debarmentCache = { rows: result.records, fetchedAt: Date.now() };
+  return result.records;
+}
+
+function shapeDebarmentRow(r: Raw): Record<string, unknown> {
+  return {
+    name: str(r.Title),
+    entity_type: str(r.Entity),
+    nationality: str(r.Nationality),
+    country: str(r.Country),
+    sanctioned_from: str(r.From),
+    sanctioned_until: str(r.To),
+    prohibited_practice: str(r['Prohibited Practice']),
+    source_bank: str(r.Source),
+    sanction_classification: str(r['Tipo de sancion del BID']),
+    sanctioning_body: str(r['IDB Sanction Source']) ?? str(r['Other Name']),
+  };
+}
+
+async function checkMdbDebarment(args: Raw): Promise<unknown> {
+  const name = strArg(args.name);
+  if (!name) {
+    return {
+      found: false,
+      reason: 'missing_argument',
+      hint: 'idb_check_mdb_debarment requires "name" — a person or firm name to check against the IDB / WBG / ADB / AfDB / EBRD cross-debarment list.',
+    };
+  }
+  const entityType = strArg(args.entity_type);
+  const sourceFilter = strArg(args.source);
+  const limit = clampInt(args.limit, 10, 1, 50);
+
+  const rows = await loadDebarment();
+  const tokens = fold(name)
+    .split(' ')
+    .filter((t) => t.length >= 2);
+  if (tokens.length === 0) {
+    return {
+      found: false,
+      reason: 'name_too_short',
+      hint: 'Pass at least one name token of 2+ characters.',
+    };
+  }
+
+  let matches = rows.filter((r) => {
+    const folded = fold(str(r.Title) ?? '');
+    return tokens.every((t) => folded.includes(t));
+  });
+  if (entityType) {
+    const et = entityType.trim().toLowerCase();
+    matches = matches.filter((r) => (str(r.Entity) ?? '').toLowerCase() === et);
+  }
+  if (sourceFilter) {
+    const sf = sourceFilter.trim().toLowerCase();
+    matches = matches.filter((r) => (str(r.Source) ?? '').toLowerCase().includes(sf));
+  }
+
+  const shaped = matches.slice(0, limit).map(shapeDebarmentRow);
+  return {
+    query: name,
+    found: shaped.length > 0,
+    match_count: matches.length,
+    records_searched: rows.length,
+    banks_covered: DEBARMENT_SOURCES,
+    matches: shaped,
+    ...(shaped.length === 0
+      ? {
+          reason: 'no_match',
+          hint: 'No debarment record across IDB or the WBG/ADB/AfDB/EBRD cross-debarment lists matched this name. Matching is accent- and case-insensitive and requires every name token to appear, so a partial name (e.g. just a surname) usually broadens rather than narrows results — try a shorter query if this seems unexpected.',
+        }
+      : {}),
+    source:
+      'IDB Open Data — Dataset of Sanctioned Firms and Individuals (data.iadb.org, keyless): IDB\'s own debarment list plus the cross-debarment lists of the World Bank Group, Asian Development Bank, African Development Bank, and EBRD.',
+  };
+}
+
+// --- tool defs ------------------------------------------------------------
+
+const tools: McpToolExport['tools'] = [
+  {
+    name: 'idb_search_notices',
+    description:
+      'Search Inter-American Development Bank (IDB) project procurement notices — live bidding notices, expressions of interest, general/specific procurement notices, and contract-award notifications for IDB-financed projects across 26 Latin American and Caribbean countries. Filter by country, sector, and keyword; defaults to open notices only (deadline not yet passed) sorted soonest-first. Each result carries the notice id, project, deadline, and a document URL. Keyless, ~37,000 notices, queried live.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        country: { type: 'string', description: 'Country name, e.g. "Peru", "Ecuador", "Jamaica". Partial/case-insensitive match. Omit for all LAC countries.' },
+        sector: { type: 'string', description: 'Sector keyword, e.g. "Energy", "Health", "Transport", "Water". Partial/case-insensitive match against the English sector name.' },
+        keyword: { type: 'string', description: 'Full-text keyword against the notice title and project name, e.g. "road rehabilitation", "software licenses".' },
+        type: {
+          type: 'string',
+          description: 'Notice type filter: "specific" (specific procurement notice), "general" (general procurement notice), "eoi" (expression of interest), "award" (contract award notification), or "rfi" (request for information). Omit for all types.',
+        },
+        open_only: { type: 'boolean', description: 'Restrict to notices whose deadline has not passed (default true). Set false to include closed/expired notices too, or when type is "award" (awards have no future deadline).' },
+        limit: { type: ['number', 'string'], description: 'Max notices to return (1-50). Default 15.' },
+      },
+    },
+  },
+  {
+    name: 'idb_get_notice',
+    description:
+      'Fetch one IDB procurement notice by its notice id (from idb_search_notices results). Returns the full record: project, loan number, sector, procurement method, publication date, deadline, and the document URL on idbdocs.iadb.org. If the id has multiple entries (amendments/re-publications), all are returned newest-first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        notice_id: { type: 'string', description: 'IDB notice id, e.g. "38846" — find ids via idb_search_notices.' },
+      },
+      required: ['notice_id'],
+    },
+  },
+  {
+    name: 'idb_search_awards',
+    description:
+      'Search Inter-American Development Bank (IDB) contract award data — which firms and individual consultants were awarded contracts under IDB-financed projects, with contract amount, sector, borrower country, and dates. ~159,000 awards. Filter by country, awarded firm name, sector, and contract year. Note: many individual-consultant contracts record the firm as "Not Available" by design (the consultant is not a named firm). Keyless, queried live against the same data as IDB\'s 70MB awards CSV — no download needed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        country: { type: 'string', description: 'Borrowing country, e.g. "Colombia", "Bolivia", "Ecuador". Partial/case-insensitive match.' },
+        firm: { type: 'string', description: 'Awarded firm name (partial/case-insensitive), e.g. "Deloitte", "Odebrecht".' },
+        sector: { type: 'string', description: 'Sector keyword, e.g. "Rural Electrification", "Health Services", "Water Supply".' },
+        year: { type: ['number', 'string'], description: 'Contract signature year, e.g. 2025.' },
+        keyword: { type: 'string', description: 'Keyword against the project name.' },
+        limit: { type: ['number', 'string'], description: 'Max awards to return (1-50). Default 15.' },
+      },
+    },
+  },
+  {
+    name: 'idb_check_mdb_debarment',
+    description:
+      'Check whether a person or firm name appears on the multilateral development bank cross-debarment list — IDB\'s own debarment/sanctions list PLUS the cross-debarred lists of the World Bank Group, Asian Development Bank, African Development Bank, and EBRD, which the five banks mutually enforce. Answers "is this vendor debarred" for procurement due-diligence. Matching is accent- and case-insensitive (handles Spanish/Portuguese diacritics like "González" vs "Gonzalez") and requires every word of the query name to appear in a record — so a full name narrows results, a bare surname broadens them. Returns each match\'s entity type, nationality, sanction dates, prohibited practice, and which bank\'s list it came from. Keyless, ~1,300 records, queried live.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Person or firm name to check, e.g. "Ricardo Reynoso Gonzalez" or "Consultora Tecnodinamica". Accents optional.' },
+        entity_type: { type: 'string', description: 'Optional filter: "Individual" or "Firm".' },
+        source: { type: 'string', description: 'Optional filter to one issuing bank, e.g. "IDB", "WBG", "ADB", "AfDB", "EBRD" (partial match against the source label).' },
+        limit: { type: ['number', 'string'], description: 'Max matches to return (1-50). Default 10.' },
+      },
+      required: ['name'],
+    },
+  },
+];
+
+async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  try {
+    switch (name) {
+      case 'idb_search_notices':
+        return await searchNotices(args);
+      case 'idb_get_notice':
+        return await getNotice(args);
+      case 'idb_search_awards':
+        return await searchAwards(args);
+      case 'idb_check_mdb_debarment':
+        return await checkMdbDebarment(args);
+      default:
+        return { error: `Unknown tool: ${name}` };
+    }
+  } catch (e) {
+    if (e instanceof Error && e.name === 'AbortError') {
+      return {
+        error: 'IDB Open Data API did not respond in time.',
+        retry_hint: 'Transient upstream slowness — retry, or narrow the query with more filters.',
+      };
+    }
+    return {
+      error: e instanceof Error ? e.message : String(e),
+      retry_hint: 'Check argument values (see inputSchema) and retry; the API itself is keyless.',
+    };
+  }
+}
+
+export default { tools, callTool, meter: { credits: 1 } } satisfies McpToolExport;
