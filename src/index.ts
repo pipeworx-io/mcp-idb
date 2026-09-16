@@ -25,287 +25,201 @@ interface McpToolExport {
 }
 
 /**
- * Runtime helpers for packs that wrap government open-data platforms.
+ * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
  *
- * Socrata (SODA), CKAN, and ArcGIS FeatureServer/MapServer between them back a large share
- * of US state and municipal data, and every pack over them re-implements the same fetch,
- * timeout, retry, and shaping code. These helpers are deliberately small and dependency-free
- * so `scripts/publish-pack.sh` can inline them into a standalone published pack.
+ * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
+ * keying on the SQLSTATE inside PostgREST's four-key error envelope. That
+ * covered the majority and structurally could not cover the rest: the rest
+ * never reach Postgres, so they carry no SQLSTATE. What was left, measured over
+ * the 24h to 2026-09-02T15:00Z (fleet #1096):
  *
- * State agency servers are slow and occasionally hostile: expect stalls, WAF interstitials
- * served with a 200 or 403, and columns whose names disagree between two datasets on the same
- * portal. `govFetchJson` therefore retries once by default and raises a message the caller can
- * turn into a `{ found: false, reason, hint }` rather than a bare throw.
+ *     5  pipeworx-catalog  get_pack_tools     Pipeworx catalog error: 522 — error code: 522
+ *     3  fleet             fleet_list_open …  upstream_down: Fleet task queue did not respond within 25s
+ *
+ * 521/522/523/526 are Cloudflare saying its edge could not reach an ORIGIN, and
+ * in both of those rows the origin is ours — `gateway.pipeworx.io` for the
+ * catalog pack (it self-fetches when the gateway hasn't injected a manifest),
+ * our own Supabase for fleet. There is no third party anywhere in either call.
+ * Same defect as #1089: our own outage filed under `upstream_down`, the one
+ * class that means "the source is unreachable and there is nothing for us to
+ * fix", which is why the problem-tools triage skips it.
+ *
+ * WHY NOT A WORDING RULE. The obvious fix is to match `fleet db error:` and
+ * `Pipeworx catalog error:` in classifyToolError. Each is emitted from exactly
+ * one site today, so it would work today. It would also rot the first time
+ * somebody rewords a label — silently, and in the direction of hiding our own
+ * outage, which is worse than the bug being fixed. Every prose rule in
+ * error-class.ts has needed widening as packs invented new wording (#409/#450/
+ * #584); that history is most of that file's comment budget.
+ *
+ * WHAT THIS KEYS ON INSTEAD: **the host the call actually reached.** A URL's
+ * hostname is a fact about the call, not a guess about its prose. Two
+ * consequences that a pack-level flag could not give us, and the reason the
+ * flag was rejected:
+ *
+ *   - It describes the CALL, not the pack. `govcon-intel` fans out to our own
+ *     Supabase AND to genuine third parties; `court-listener` holds our cache
+ *     in Supabase and fetches courtlistener.com. An `internallyHosted: true` on
+ *     either pack would relabel a real third-party outage as ours — inventing
+ *     work, which is the same class of error in the opposite direction.
+ *   - It covers every future internal pack for free, instead of one declared
+ *     slug at a time.
+ *
+ * WHY IT SURVIVES A REWORD. The marker below is not matched as a literal by two
+ * separate files. `markInternalOrigin()` writes it and `internalHostMetricsClass()`
+ * reads it, both from the single exported `INTERNAL_ORIGIN_MARKER` constant in
+ * this module — so changing the wording changes both sides in the same edit and
+ * cannot desynchronise them. The pack's own label (`fleet db error:`,
+ * `Pipeworx catalog error:`) is not read at all: reword it freely, the class is
+ * unaffected. That is the property `stripClassPrefix` lacked when it drifted
+ * from its own classifier three times and needed a CI gate to hold them
+ * together.
+ *
+ * WHERE THE 5xx TEST LIVES. `markInternalOrigin` is called from the places that
+ * hold the real `Response` — `httpError`/`httpErrorMessage` and the timeout
+ * branch of `fetchWithTimeout` in `shared/src/http.ts` — so "is this an
+ * availability failure" is decided from the actual status code, never re-derived
+ * by scraping a number out of a sentence. A 404 from our own registry for a slug
+ * that does not exist is a caller's bad argument and is deliberately NOT marked.
  */
 
-const DEFAULT_UA = 'pipeworx-mcp/1.0 (+https://pipeworx.io)';
-const DEFAULT_TIMEOUT_MS = 15_000;
+/**
+ * OUR OWN web service was unreachable — not an upstream, and never `upstream_down`.
+ *
+ * ONE value, not three, unlike `internal_db_*`. That split existed because a
+ * slow query, an exhausted pool and an unknown SQLSTATE have different owners
+ * and different fixes. Here there is only one story to tell — an origin we run
+ * did not answer the edge — and one owner. A bucket with no distinct owner per
+ * value is decoration; #724 is what happens when a class holds several
+ * situations, and inventing sub-values ahead of a reason to act on them
+ * differently is the same mistake with the sign flipped.
+ *
+ * METRICS ONLY, exactly like PLATFORM_KEY_ERROR_CLASS and the internal_db
+ * values. `classifyToolError` still answers `upstream_down` for the retry and
+ * hint paths, which only care whether retrying or a sibling tool might work —
+ * and it might. Nothing a caller sees or is charged changes here.
+ *
+ * READ SIDE: this value is in BROKEN_TOOL_CLASSES, FAULT_CLASSES and
+ * ALL_ERROR_CLASSES in `workers/registry-api/src/index.ts`. All three, or it
+ * lands on no dashboard — fleet #721 is the warning, where the #719 split
+ * worked on the write side and was invisible for weeks.
+ */
+const INTERNAL_SERVICE_UNREACHABLE_CLASS = 'internal_service_unreachable';
 
-interface GovFetchOpts {
-  /** Sent as Accept; defaults to application/json. */
-  accept?: string;
-  /** Socrata app token, sent as X-App-Token. Public endpoints work without one. */
-  appToken?: string;
-  /** Per-attempt budget. State ArcGIS servers routinely need >12s under load. */
-  timeoutMs?: number;
-  /** Extra attempts after the first. Defaults to 1. */
-  retries?: number;
-  userAgent?: string;
-}
+/**
+ * The token that carries "this origin is ours" from the call site to the
+ * classifier.
+ *
+ * Appended to the error message rather than attached to the Error object,
+ * because the object does not survive the trip: 275 packs return `{ error:
+ * string }` instead of throwing, the gateway reads `observedError` as a string,
+ * and the fleet pack rebuilds its error from a captured status + body across a
+ * retry loop. A property on an Error would be dropped by every one of those
+ * paths and the class would work in tests and vanish in production.
+ *
+ * WORDING IS LOAD-BEARING, same rule as labelAge's note in authority.ts. This
+ * string is appended to a pack's thrown Error message (shared/src/http.ts),
+ * and a thrown Error's message is exactly what the gateway hands back to the
+ * caller as `content[0].text` when nothing rewrites it (workers/gateway/src
+ * catches the throw and sets `rawResult.message = stripClassPrefix(error)`,
+ * which does not touch this suffix) — so the original wording,
+ * " [pipeworx-hosted origin — our own service, not a third party]", was not a
+ * theoretical leak: it shipped live on pipeworx-catalog's 522s, 7 times in 6
+ * hours on 2026-09-02 (see tests/golden-internal-service.test.ts), verbatim
+ * naming Pipeworx as the host. check:hosting-claims never caught it because it
+ * did not scan shared/ at all (task #2009). Reworded to describe the
+ * OBSERVATION (the origin did not answer) without a claim about who runs it —
+ * the identical fix labelAge got: drop the possessive, keep the fact.
+ */
+const INTERNAL_ORIGIN_MARKER = ' [origin did not respond — retry before concluding the named source is down]';
 
-async function govFetchText(url: string, opts: GovFetchOpts = {}): Promise<string> {
-  const retries = opts.retries ?? 1;
-  let lastErr: unknown;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const headers: Record<string, string> = {
-        'User-Agent': opts.userAgent ?? DEFAULT_UA,
-        Accept: opts.accept ?? 'application/json',
-      };
-      if (opts.appToken) headers['X-App-Token'] = opts.appToken;
-      const res = await fetch(url, {
-        headers,
-        signal: AbortSignal.timeout(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS),
-      });
-      if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        throw new Error(`upstream ${res.status}${body ? `: ${body.slice(0, 180)}` : ''}`);
-      }
-      return await res.text();
-    } catch (err) {
-      lastErr = err;
-      if (attempt === retries) break;
-    }
-  }
-  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
-}
+/**
+ * Supabase's data plane for a project is `<ref>.supabase.co`, where the ref is
+ * exactly twenty lowercase letters (ours is `pqauisounztsgdgfkhke`).
+ *
+ * Matching the shape rather than listing the ref keeps this correct when we add
+ * a project — `supabaseEnv` on a pack entry already points some packs at a
+ * second one — while still excluding `status.supabase.co`, which is Supabase's
+ * own status page and emphatically not our database. Verified 2026-09-02 by
+ * `grep -rhoE '[a-z0-9-]+\.supabase\.(co|in)' mcps shared workers scripts`: the
+ * only real project ref anywhere in the tree is ours, the rest are doc
+ * placeholders (`abc`, `xyz`, `example`) which this pattern also excludes. Same
+ * finding internal-db-class.ts relies on for the PostgREST envelope being ours
+ * by construction.
+ */
+const SUPABASE_PROJECT_HOST = /^[a-z]{20}\.supabase\.(co|in)$/;
 
-async function govFetchJson<T = unknown>(url: string, opts: GovFetchOpts = {}): Promise<T> {
-  const text = await govFetchText(url, opts);
+/**
+ * Is this a host WE run?
+ *
+ * Deliberately NOT including `*.workers.dev`: plenty of third-party APIs are
+ * hosted on workers.dev, so the suffix says where something runs and not who
+ * owns it. Every internal call we actually make goes to a `pipeworx.io`
+ * hostname or to our Supabase project, both of which are ownership facts.
+ *
+ * `workers/gateway/src/provenance.ts`'s `OUR_HOSTS` answers the same
+ * question and DOES include `workers.dev` — a documented divergence
+ * (task #2051), not a bug to converge. That list decides what a response may
+ * cite as a data SOURCE, where a false negative (citing our own worker as an
+ * external source) is the hosting-disclosure leak this whole file exists to
+ * prevent, so it errs broad. This one decides who gets BLAMED for a 5xx in
+ * outage metrics read by on-call, where a false positive (crediting our own
+ * infra with a third party's outage) hides the real failure, so it errs
+ * narrow. Same suffix, opposite direction, because they are never called for
+ * the same reason.
+ *
+ * Returns false on anything unparseable rather than throwing — this runs inside
+ * an error path, and an error path that can itself throw turns a diagnosable
+ * failure into a mystery.
+ */
+function isPipeworxOrigin(url: string | URL | undefined | null): boolean {
+  if (!url) return false;
+  let host: string;
   try {
-    return JSON.parse(text) as T;
+    host = new URL(url instanceof URL ? url.href : url).hostname.toLowerCase();
   } catch {
-    // A WAF interstitial arrives as HTML on the JSON path; say so plainly, because the
-    // alternative reads to a caller as our own parsing bug.
-    const looksLikeChallenge = /<html|just a moment|captcha/i.test(text.slice(0, 400));
-    throw new Error(
-      looksLikeChallenge
-        ? `upstream returned an HTML challenge page instead of JSON (${text.slice(0, 90).replace(/\s+/g, ' ')})`
-        : `upstream returned non-JSON (${text.slice(0, 120)})`,
-    );
+    return false;
   }
-}
-
-// ── Socrata (SODA 2.x) ──────────────────────────────────────────────
-
-interface SoqlQuery {
-  select?: string;
-  where?: string;
-  group?: string;
-  order?: string;
-  limit?: number;
-  offset?: number;
-}
-
-/** Escape a value for interpolation into a SoQL string literal. */
-function soqlEscape(v: string): string {
-  return v.replace(/'/g, "''");
-}
-
-function soqlUrl(domain: string, resource: string, q: SoqlQuery): string {
-  const p = new URLSearchParams();
-  if (q.select) p.set('$select', q.select);
-  if (q.where) p.set('$where', q.where);
-  if (q.group) p.set('$group', q.group);
-  if (q.order) p.set('$order', q.order);
-  p.set('$limit', String(q.limit ?? 1000));
-  if (q.offset) p.set('$offset', String(q.offset));
-  return `https://${domain}/resource/${resource}.json?${p.toString()}`;
-}
-
-async function soqlRows<T = Record<string, string>>(
-  domain: string,
-  resource: string,
-  q: SoqlQuery,
-  opts: GovFetchOpts = {},
-): Promise<T[]> {
-  return govFetchJson<T[]>(soqlUrl(domain, resource, q), opts);
+  if (host === 'pipeworx.io' || host.endsWith('.pipeworx.io')) return true;
+  return SUPABASE_PROJECT_HOST.test(host);
 }
 
 /**
- * A Socrata dataset's last row update, as YYYY-MM-DD, for an `as_of` field. Best-effort:
- * resolves to null rather than failing a call that otherwise has data.
+ * Append the marker when this failure was OUR origin failing to answer.
+ *
+ * `status` is the HTTP status when there is one, and omitted for a timeout —
+ * where there is no response at all, and "the origin did not answer" is the
+ * whole observation. Statuses below 500 are left alone: a 404 from our own
+ * registry for a slug that does not exist is the caller's argument, not our
+ * outage, and marking it would put ordinary 404s on the incident dashboard.
+ *
+ * Idempotent, so a message that is wrapped and re-marked on the way up (the
+ * fleet pack's retry loop re-throws through two layers) carries the marker once.
  */
-async function soqlUpdatedAt(
-  domain: string,
-  resource: string,
-  opts: GovFetchOpts = {},
-): Promise<string | null> {
-  try {
-    const meta = await govFetchJson<{ rowsUpdatedAt?: number }>(
-      `https://${domain}/api/views/${resource}.json`,
-      { ...opts, retries: 0 },
-    );
-    return meta.rowsUpdatedAt ? new Date(meta.rowsUpdatedAt * 1000).toISOString().slice(0, 10) : null;
-  } catch {
-    return null;
-  }
+function markInternalOrigin(
+  message: string,
+  url: string | URL | undefined | null,
+  status?: number,
+): string {
+  if (status !== undefined && status < 500) return message;
+  if (!isPipeworxOrigin(url)) return message;
+  if (message.includes(INTERNAL_ORIGIN_MARKER)) return message;
+  return message + INTERNAL_ORIGIN_MARKER;
 }
 
-/** Largest value of a column, e.g. the latest `year_month` a dataset carries. */
-async function soqlMax(
-  domain: string,
-  resource: string,
-  column: string,
-  opts: GovFetchOpts = {},
-): Promise<string | null> {
-  try {
-    const rows = await soqlRows<Record<string, string>>(
-      domain,
-      resource,
-      { select: `max(${column}) as mx` },
-      opts,
-    );
-    return rows[0]?.mx ?? null;
-  } catch {
-    return null;
-  }
+/**
+ * Which blob4 value a failure from our own web services books as, or undefined
+ * if this is not one.
+ *
+ * Ordered AFTER `internalDbMetricsClass` at the call site: a PostgREST envelope
+ * from our own Supabase is a strictly more specific statement about the same
+ * row (which of our services, and why), and the two cannot disagree about
+ * whether the failure is ours.
+ */
+function internalHostMetricsClass(error: string): string | undefined {
+  return error.includes(INTERNAL_ORIGIN_MARKER) ? INTERNAL_SERVICE_UNREACHABLE_CLASS : undefined;
 }
 
-// ── CKAN ────────────────────────────────────────────────────────────
-
-/** CKAN's read-only SQL endpoint (datastore_search_sql). */
-async function ckanSql$shared<T = Record<string, string>>(
-  domain: string,
-  sql: string,
-  opts: GovFetchOpts = {},
-): Promise<T[]> {
-  const body = await govFetchJson<{
-    success?: boolean;
-    result?: { records?: T[] };
-    error?: unknown;
-  }>(`https://${domain}/api/3/action/datastore_search_sql?sql=${encodeURIComponent(sql)}`, opts);
-  if (!body.success || !body.result?.records) {
-    throw new Error(`CKAN rejected the query: ${JSON.stringify(body.error ?? {}).slice(0, 200)}`);
-  }
-  return body.result.records;
-}
-
-async function ckanRows<T = Record<string, unknown>>(
-  domain: string,
-  resourceId: string,
-  limit: number,
-  opts: GovFetchOpts = {},
-): Promise<T[]> {
-  const body = await govFetchJson<{ result?: { records?: T[] } }>(
-    `https://${domain}/api/3/action/datastore_search?resource_id=${resourceId}&limit=${limit}`,
-    opts,
-  );
-  return body.result?.records ?? [];
-}
-
-// ── ArcGIS (FeatureServer / MapServer) ──────────────────────────────
-
-interface ArcgisFeature {
-  attributes: Record<string, unknown>;
-  geometry?: { x?: number; y?: number };
-}
-
-interface ArcgisQueryOpts extends GovFetchOpts {
-  where?: string;
-  outFields?: string;
-  orderBy?: string;
-  limit?: number;
-  /** Request geometry in WGS84. Many layers store State Plane, so read lat/lng from here
-   *  rather than from XCOORD/YCOORD attribute columns. */
-  geometry?: boolean;
-  distinct?: boolean;
-}
-
-async function arcgisQuery(layerUrl: string, o: ArcgisQueryOpts = {}): Promise<ArcgisFeature[]> {
-  const p = new URLSearchParams({
-    where: o.where ?? '1=1',
-    outFields: o.outFields ?? '*',
-    returnGeometry: o.geometry ? 'true' : 'false',
-    f: 'json',
-  });
-  if (o.geometry) p.set('outSR', '4326');
-  if (o.orderBy) p.set('orderByFields', o.orderBy);
-  if (o.limit) p.set('resultRecordCount', String(o.limit));
-  if (o.distinct) p.set('returnDistinctValues', 'true');
-  const body = await govFetchJson<{ features?: ArcgisFeature[]; error?: { message?: string } }>(
-    `${layerUrl}/query?${p.toString()}`,
-    o,
-  );
-  if (body.error) throw new Error(`ArcGIS: ${body.error.message ?? 'query rejected'}`);
-  return body.features ?? [];
-}
-
-/** Turn "Y"/"Yes"/"true" flag columns into a list of human-readable service labels. */
-function arcgisFlagLabels(
-  attrs: Record<string, unknown>,
-  labelByField: Record<string, string>,
-): string[] {
-  return Object.entries(labelByField)
-    .filter(([field]) => /^(y|yes|true)$/i.test(String(attrs[field] ?? '')))
-    .map(([, label]) => label);
-}
-
-// ── Small shaping utilities ─────────────────────────────────────────
-
-/** A recoverable "no answer" result. The hint should name something that does work. */
-function govNotFound(
-  reason: string,
-  hint: string,
-  extra: Record<string, unknown> = {},
-): Record<string, unknown> {
-  return { found: false, reason, hint, ...extra };
-}
-
-function govNumber(v: unknown): number | null {
-  if (v === null || v === undefined || v === '') return null;
-  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
-  const s = String(v).trim();
-  if (s === '') return null;
-  // Parse as-is first. Socrata returns an all-zero aggregate as "0E-24", and stripping
-  // non-numeric characters turns that into "0-24" → NaN, i.e. a real zero reported as
-  // unknown. Number() understands scientific notation, so only fall back to stripping
-  // for values carrying formatting (currency symbols, thousands separators).
-  const direct = Number(s);
-  if (Number.isFinite(direct)) return direct;
-  // Require a digit before stripping: otherwise "abc" reduces to "" and Number("") is 0,
-  // reporting a parse failure as a real zero.
-  if (!/\d/.test(s)) return null;
-  const stripped = Number(s.replace(/[^0-9.\-]/g, ''));
-  return Number.isFinite(stripped) ? stripped : null;
-}
-
-/** Trimmed string argument, or undefined when absent or blank. */
-function govString(args: Record<string, unknown>, key: string): string | undefined {
-  const v = args[key];
-  if (v === undefined || v === null) return undefined;
-  const s = String(v).trim();
-  return s === '' ? undefined : s;
-}
-
-function govLimit(raw: unknown, def: number, max: number): number {
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return def;
-  return Math.min(Math.floor(n), max);
-}
-
-/** Case-insensitive substring test that tolerates a missing haystack. */
-function govContains(hay: unknown, needle: string): boolean {
-  return typeof hay === 'string' && hay.toLowerCase().includes(needle.toLowerCase());
-}
-
-/** Join day/hours pairs into one line, dropping closed and empty days. */
-function govJoinHours(parts: Array<[string, unknown]>): string | null {
-  const out = parts
-    .filter(([, v]) => v && String(v).trim() && !/^closed$/i.test(String(v).trim()))
-    .map(([day, v]) => `${day} ${String(v).trim()}`);
-  return out.length ? out.join('; ') : null;
-}
 
 /**
  * One place to turn a failed `fetch` into an error a caller can act on.
@@ -720,183 +634,6 @@ function pickMessage(node: unknown, depth: number): string | null {
  *  whitespace make a multi-line body unreadable there. */
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
-}
-
-/**
- * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
- *
- * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
- * keying on the SQLSTATE inside PostgREST's four-key error envelope. That
- * covered the majority and structurally could not cover the rest: the rest
- * never reach Postgres, so they carry no SQLSTATE. What was left, measured over
- * the 24h to 2026-09-02T15:00Z (fleet #1096):
- *
- *     5  pipeworx-catalog  get_pack_tools     Pipeworx catalog error: 522 — error code: 522
- *     3  fleet             fleet_list_open …  upstream_down: Fleet task queue did not respond within 25s
- *
- * 521/522/523/526 are Cloudflare saying its edge could not reach an ORIGIN, and
- * in both of those rows the origin is ours — `gateway.pipeworx.io` for the
- * catalog pack (it self-fetches when the gateway hasn't injected a manifest),
- * our own Supabase for fleet. There is no third party anywhere in either call.
- * Same defect as #1089: our own outage filed under `upstream_down`, the one
- * class that means "the source is unreachable and there is nothing for us to
- * fix", which is why the problem-tools triage skips it.
- *
- * WHY NOT A WORDING RULE. The obvious fix is to match `fleet db error:` and
- * `Pipeworx catalog error:` in classifyToolError. Each is emitted from exactly
- * one site today, so it would work today. It would also rot the first time
- * somebody rewords a label — silently, and in the direction of hiding our own
- * outage, which is worse than the bug being fixed. Every prose rule in
- * error-class.ts has needed widening as packs invented new wording (#409/#450/
- * #584); that history is most of that file's comment budget.
- *
- * WHAT THIS KEYS ON INSTEAD: **the host the call actually reached.** A URL's
- * hostname is a fact about the call, not a guess about its prose. Two
- * consequences that a pack-level flag could not give us, and the reason the
- * flag was rejected:
- *
- *   - It describes the CALL, not the pack. `govcon-intel` fans out to our own
- *     Supabase AND to genuine third parties; `court-listener` holds our cache
- *     in Supabase and fetches courtlistener.com. An `internallyHosted: true` on
- *     either pack would relabel a real third-party outage as ours — inventing
- *     work, which is the same class of error in the opposite direction.
- *   - It covers every future internal pack for free, instead of one declared
- *     slug at a time.
- *
- * WHY IT SURVIVES A REWORD. The marker below is not matched as a literal by two
- * separate files. `markInternalOrigin()` writes it and `internalHostMetricsClass()`
- * reads it, both from the single exported `INTERNAL_ORIGIN_MARKER` constant in
- * this module — so changing the wording changes both sides in the same edit and
- * cannot desynchronise them. The pack's own label (`fleet db error:`,
- * `Pipeworx catalog error:`) is not read at all: reword it freely, the class is
- * unaffected. That is the property `stripClassPrefix` lacked when it drifted
- * from its own classifier three times and needed a CI gate to hold them
- * together.
- *
- * WHERE THE 5xx TEST LIVES. `markInternalOrigin` is called from the places that
- * hold the real `Response` — `httpError`/`httpErrorMessage` and the timeout
- * branch of `fetchWithTimeout` in `shared/src/http.ts` — so "is this an
- * availability failure" is decided from the actual status code, never re-derived
- * by scraping a number out of a sentence. A 404 from our own registry for a slug
- * that does not exist is a caller's bad argument and is deliberately NOT marked.
- */
-
-/**
- * OUR OWN web service was unreachable — not an upstream, and never `upstream_down`.
- *
- * ONE value, not three, unlike `internal_db_*`. That split existed because a
- * slow query, an exhausted pool and an unknown SQLSTATE have different owners
- * and different fixes. Here there is only one story to tell — an origin we run
- * did not answer the edge — and one owner. A bucket with no distinct owner per
- * value is decoration; #724 is what happens when a class holds several
- * situations, and inventing sub-values ahead of a reason to act on them
- * differently is the same mistake with the sign flipped.
- *
- * METRICS ONLY, exactly like PLATFORM_KEY_ERROR_CLASS and the internal_db
- * values. `classifyToolError` still answers `upstream_down` for the retry and
- * hint paths, which only care whether retrying or a sibling tool might work —
- * and it might. Nothing a caller sees or is charged changes here.
- *
- * READ SIDE: this value is in BROKEN_TOOL_CLASSES, FAULT_CLASSES and
- * ALL_ERROR_CLASSES in `workers/registry-api/src/index.ts`. All three, or it
- * lands on no dashboard — fleet #721 is the warning, where the #719 split
- * worked on the write side and was invisible for weeks.
- */
-const INTERNAL_SERVICE_UNREACHABLE_CLASS = 'internal_service_unreachable';
-
-/**
- * The token that carries "this origin is ours" from the call site to the
- * classifier.
- *
- * Appended to the error message rather than attached to the Error object,
- * because the object does not survive the trip: 275 packs return `{ error:
- * string }` instead of throwing, the gateway reads `observedError` as a string,
- * and the fleet pack rebuilds its error from a captured status + body across a
- * retry loop. A property on an Error would be dropped by every one of those
- * paths and the class would work in tests and vanish in production.
- *
- * Written as a sentence rather than a sigil because it is going to be read by
- * whoever gets the error, and "our own service, not a third party" is the
- * single most useful thing to tell them — fetchWithTimeout's own comment
- * (fleet #1047) is about exactly this ambiguity, where blaming a healthy vendor
- * by name sent the next person waiting for an outage that did not exist.
- */
-const INTERNAL_ORIGIN_MARKER = ' [pipeworx-hosted origin — our own service, not a third party]';
-
-/**
- * Supabase's data plane for a project is `<ref>.supabase.co`, where the ref is
- * exactly twenty lowercase letters (ours is `pqauisounztsgdgfkhke`).
- *
- * Matching the shape rather than listing the ref keeps this correct when we add
- * a project — `supabaseEnv` on a pack entry already points some packs at a
- * second one — while still excluding `status.supabase.co`, which is Supabase's
- * own status page and emphatically not our database. Verified 2026-09-02 by
- * `grep -rhoE '[a-z0-9-]+\.supabase\.(co|in)' mcps shared workers scripts`: the
- * only real project ref anywhere in the tree is ours, the rest are doc
- * placeholders (`abc`, `xyz`, `example`) which this pattern also excludes. Same
- * finding internal-db-class.ts relies on for the PostgREST envelope being ours
- * by construction.
- */
-const SUPABASE_PROJECT_HOST = /^[a-z]{20}\.supabase\.(co|in)$/;
-
-/**
- * Is this a host WE run?
- *
- * Deliberately NOT including `*.workers.dev`: plenty of third-party APIs are
- * hosted on workers.dev, so the suffix says where something runs and not who
- * owns it. Every internal call we actually make goes to a `pipeworx.io`
- * hostname or to our Supabase project, both of which are ownership facts.
- *
- * Returns false on anything unparseable rather than throwing — this runs inside
- * an error path, and an error path that can itself throw turns a diagnosable
- * failure into a mystery.
- */
-function isPipeworxOrigin(url: string | URL | undefined | null): boolean {
-  if (!url) return false;
-  let host: string;
-  try {
-    host = new URL(url instanceof URL ? url.href : url).hostname.toLowerCase();
-  } catch {
-    return false;
-  }
-  if (host === 'pipeworx.io' || host.endsWith('.pipeworx.io')) return true;
-  return SUPABASE_PROJECT_HOST.test(host);
-}
-
-/**
- * Append the marker when this failure was OUR origin failing to answer.
- *
- * `status` is the HTTP status when there is one, and omitted for a timeout —
- * where there is no response at all, and "the origin did not answer" is the
- * whole observation. Statuses below 500 are left alone: a 404 from our own
- * registry for a slug that does not exist is the caller's argument, not our
- * outage, and marking it would put ordinary 404s on the incident dashboard.
- *
- * Idempotent, so a message that is wrapped and re-marked on the way up (the
- * fleet pack's retry loop re-throws through two layers) carries the marker once.
- */
-function markInternalOrigin(
-  message: string,
-  url: string | URL | undefined | null,
-  status?: number,
-): string {
-  if (status !== undefined && status < 500) return message;
-  if (!isPipeworxOrigin(url)) return message;
-  if (message.includes(INTERNAL_ORIGIN_MARKER)) return message;
-  return message + INTERNAL_ORIGIN_MARKER;
-}
-
-/**
- * Which blob4 value a failure from our own web services books as, or undefined
- * if this is not one.
- *
- * Ordered AFTER `internalDbMetricsClass` at the call site: a PostgREST envelope
- * from our own Supabase is a strictly more specific statement about the same
- * row (which of our services, and why), and the two cannot disagree about
- * whether the failure is ours.
- */
-function internalHostMetricsClass(error: string): string | undefined {
-  return error.includes(INTERNAL_ORIGIN_MARKER) ? INTERNAL_SERVICE_UNREACHABLE_CLASS : undefined;
 }
 /**
  * IDB (Inter-American Development Bank) Procurement MCP.
