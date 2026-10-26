@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-idb",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "IDB (Inter-American Development Bank) Procurement MCP.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-dc49e1a92d3645a02a9044089afe7f666835998bc0c0c17e0fd9e31deec1a996",
-    "sourceCommit": "1064560fd9dcd0d6fc2606298c2ba244b3a1fbeb"
+    "sourceHash": "v1-5c440da5c30c3665422c24368b63d33c44e59c2e17813800b3f64b4de8f2b21c",
+    "sourceCommit": "24e32b525f9c0b2fd7d94b519b08abb108cc11cd"
   }
 }
